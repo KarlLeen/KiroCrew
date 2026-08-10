@@ -337,6 +337,61 @@ class TestNotificationPersistence:
         ]
         assert rows[0]["acked"] is True
 
+    def test_clear_broadcasts_ws_event_after_rewrite(self, monkeypatch, tmp_path) -> None:
+        """clear_notifications must broadcast `notifications_clear` so every
+        connected dashboard view drops its copy of the list — otherwise a
+        second window/tab keeps stale items and a stale bell badge. The
+        broadcast fires only after the disk rewrite is durable, mirroring
+        ack_notification's rewrite-then-broadcast order."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = DashboardState(
+            sessions=MagicMock(count=0),
+            crons=MagicMock(),
+            lessons=MagicMock(),
+            start_time=0.0,
+        )
+        order: list[str] = []
+        state.broadcast_ws = MagicMock(side_effect=lambda *a, **k: order.append("broadcast"))
+
+        real_rewrite = state._rewrite_notifications_async
+
+        async def tracked_rewrite() -> None:
+            await real_rewrite()
+            order.append("rewrite")
+
+        monkeypatch.setattr(state, "_rewrite_notifications_async", tracked_rewrite)
+
+        async def scenario() -> None:
+            state._deliver_note({"ts": "t1", "kind": "cron", "title": "A", "body": "b"})
+            await state.clear_notifications()
+
+        asyncio.run(scenario())
+        assert state._notification_log == []
+        assert state._unread_count == 0
+        state.broadcast_ws.assert_called_once_with("notifications_clear", {})
+        assert order == ["rewrite", "broadcast"]
+
+    def test_clear_of_empty_log_is_idempotent(self, monkeypatch, tmp_path) -> None:
+        """Clearing an already-empty list is a no-op, never an error: the
+        broadcast still fires (idempotent on the client) and the file rewrite
+        leaves an empty log."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = DashboardState(
+            sessions=MagicMock(count=0),
+            crons=MagicMock(),
+            lessons=MagicMock(),
+            start_time=0.0,
+        )
+        state.broadcast_ws = MagicMock()
+
+        async def scenario() -> None:
+            await state.clear_notifications()
+            await state.clear_notifications()
+
+        asyncio.run(scenario())
+        assert state._notification_log == []
+        assert state.broadcast_ws.call_count == 2
+
     def test_ack_all_rewrite_not_overtaken_by_queued_append(
         self, monkeypatch, tmp_path
     ) -> None:

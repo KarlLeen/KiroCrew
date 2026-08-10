@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import reducer, {
   addNotification,
   ackNotificationByTs,
+  clearAllNotifications,
   fetchNotifications,
   clearNotifications,
   deleteNotification,
@@ -37,6 +38,16 @@ describe('notificationsSlice', () => {
       const state = reducer({ items: [n1, n2] }, ackNotificationByTs('1'))
       expect(state.items[0].acked).toBe(true)
       expect(state.items[1].acked).toBeUndefined()
+    })
+
+    it('clearAllNotifications empties items (WS notifications_clear sync)', () => {
+      const state = reducer({ items: [n1, n2] }, clearAllNotifications())
+      expect(state.items).toEqual([])
+    })
+
+    it('clearAllNotifications on an empty list is a no-op, not an error', () => {
+      const state = reducer({ items: [] }, clearAllNotifications())
+      expect(state.items).toEqual([])
     })
   })
 

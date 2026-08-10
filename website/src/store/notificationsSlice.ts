@@ -76,6 +76,12 @@ const notificationsSlice = createSlice({
     removeNotificationByTs(state, action: PayloadAction<string>) {
       state.items = state.items.filter(n => n.ts !== action.payload)
     },
+    /** WS `notifications_clear` sync: another view cleared the inbox, so this
+     *  view drops its copy too (the bell badge derives from `items`).
+     *  Idempotent — clearing an already-empty list is a no-op. */
+    clearAllNotifications(state) {
+      state.items = []
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -99,5 +105,5 @@ const notificationsSlice = createSlice({
   },
 })
 
-export const { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs } = notificationsSlice.actions
+export const { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications } = notificationsSlice.actions
 export default notificationsSlice.reducer

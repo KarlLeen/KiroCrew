@@ -3129,10 +3129,20 @@ class DashboardState:
         return False
 
     async def clear_notifications(self) -> None:
-        """Remove all notifications from memory and disk."""
+        """Remove all notifications from memory and disk.
+
+        Broadcasts ``notifications_clear`` after the rewrite is durable
+        (mirroring ``ack_notification``'s rewrite-then-broadcast order) so
+        every connected dashboard view drops its copy of the list. Without
+        the broadcast only the clearing view converges — any other live view
+        (second window, another tab, an embedded viewport) keeps stale items
+        and therefore a stale bell badge. Clearing an already-empty list is
+        a no-op on every client, never an error.
+        """
         self._notification_log.clear()
         self._unread_count = 0
         await self._rewrite_notifications_async()
+        self.broadcast_ws("notifications_clear", {})
 
     def get_slot(self, name: str) -> _ChatSlot | None:
         """Look up a slot by name without creating it. Returns None if absent."""
