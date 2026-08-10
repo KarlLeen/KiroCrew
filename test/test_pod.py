@@ -23,6 +23,7 @@ from kiro_crew.pod.config import (
     DEFAULT_LIVE_PORT,
     DEFAULT_UNIT_PREFIX,
     PodConfig,
+    pod_kiro_home,
 )
 
 # Stand-in for a version-manager node bin dir (mise/nvm/fnm/volta/asdf install
@@ -566,6 +567,45 @@ class TestPodEnv:
         assert env["KIROCREW_HOME"].endswith("home")
         assert env["KIROCREW_PROJECT_DIR"].endswith("co")
 
+    def test_kiro_home_is_the_shared_derivation_inside_the_pod_home(
+        self, cfg: PodConfig, tmp_path: Path
+    ) -> None:
+        """The exported value must BE ``pod_kiro_home``, not a parallel spelling.
+
+        ``boot`` records this exact value for the session-storage reclaim guard, so
+        a second spelling here lets the guard decide from a path the pod does not
+        actually read — reclaim refused with no way to clear it, or a store shared
+        without one.
+        """
+        home = tmp_path / "home"
+        env = rt.build_pod_env(cfg, home, 7999, tmp_path / "co")
+        assert env["KIRO_HOME"] == str(pod_kiro_home(home))
+        # And it stays under the pod HOME, so teardown reclaims it.
+        assert Path(env["KIRO_HOME"]).is_relative_to(home)
+
+    def test_the_recorded_store_round_trips_what_was_exported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The record is read back as the pod's store, and absence is not a path.
+
+        Session-storage reclaim reads this to decide whether a live pod shares its
+        replay store; ``None`` must mean "cannot be established" so the caller can
+        fail closed instead of receiving a re-derived guess.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "pod-env"))
+        c = PodConfig.load()
+
+        assert rt.recorded_replay_store(c, "demo") is None
+
+        exported = rt.build_pod_env(c, c.home_dir("demo"), 7999, tmp_path / "co")
+        rt.record_replay_store(c, "demo", exported["KIRO_HOME"])
+
+        assert rt.recorded_replay_store(c, "demo") == Path(exported["KIRO_HOME"])
+        # Recording must not disturb the pinned inputs sharing the file.
+        rt.pin_checkout(c, "demo", tmp_path / "co")
+        assert rt.recorded_replay_store(c, "demo") == Path(exported["KIRO_HOME"])
+        assert rt.read_env_file(c, "demo")["CHECKOUT"] == str(tmp_path / "co")
+
 
 class TestPodConfigWrite:
     def test_blank_pod_writes_tunnel_off_config(self, tmp_path: Path) -> None:
@@ -630,6 +670,23 @@ class TestRuntimeHelpers:
         )
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(stdout=out))
         assert rt.active_names(cfg) == {"alpha", "beta-two"}
+        assert rt.live_names(cfg) == {"alpha", "beta-two"}
+
+    def test_live_names_refuses_a_failed_query_that_active_names_reads_as_idle(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed listing looks exactly like an idle host, so the twin must raise.
+
+        A caller that must not act while a pod is live cannot use the empty set:
+        reclaiming session storage on a wrong "nothing is running" destroys a
+        conversation a live pod could still resume.
+        """
+        monkeypatch.setattr(
+            rt, "systemctl", lambda *a, **k: _cp(returncode=1, stderr="Failed to connect to bus\n")
+        )
+        assert rt.active_names(cfg) == set()  # the listing shape, unchanged
+        with pytest.raises(rt.PodError, match="could not list active pod units"):
+            rt.live_names(cfg)
 
     def test_unit_state(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -1296,6 +1353,30 @@ class TestBootTimeSettings:
     ) -> None:
         argv = self._booted_argv(tmp_path, monkeypatch, {"APPROVAL": "reads"})
         assert argv == ["gateway", "--no-crons", "--approval", "reads"]
+
+    def test_boot_records_the_store_it_hands_the_pod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The record must exist by the time the pod is running, not later.
+
+        Session-storage reclaim reads it to decide whether this pod shares the
+        default instance's replay store, and treats absence as sharing — so a boot
+        that execs without recording leaves a live pod indistinguishable from a
+        legacy one and blocks reclaim for as long as it runs.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        c = PodConfig.load()
+        rt.pin_checkout(c, "x", _ready_worktree(tmp_path, "x"))
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        seen: list[dict[str, str]] = []
+        monkeypatch.setattr(os, "execve", lambda path, argv, e: seen.append(e))
+
+        rt.boot(c, "x")
+
+        assert len(seen) == 1, "boot did not exec exactly once"
+        # Recorded, and equal to what the pod was actually handed.
+        assert rt.recorded_replay_store(c, "x") == Path(seen[0]["KIRO_HOME"])
 
     def test_boot_argv_unchanged_when_unset(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -99,7 +99,7 @@ the legacy stem fails instead of agreeing with itself.
 
 The exclusion set comes from **this** instance's session map, but the kiro-cli
 replay store can be shared. When `KIROCREW_HOME` is overridden while `KIRO_HOME` is
-not — a dev gateway or a pod — this instance has its own map and the machine-wide
+not — a dev gateway — this instance has its own map and the machine-wide
 store, so every session belonging to the default instance is missing from the map it
 consults: a resumable conversation reads as retired and could be staged and then
 emptied out from under a gateway this process cannot see.
@@ -120,18 +120,34 @@ outright. Two things about how it decides:
   install that has not yet migrated legitimately resolves to `~/.kirocrew`, and
   treating that as an isolated instance refused every such install.
 - The refusal is **symmetric**. A default instance is also blocked when a
-  discoverable co-tenant shares its store: a pod isolates `KIROCREW_HOME` but
-  deliberately not `KIRO_HOME`, so each pod home under the pod root reads the
-  machine-wide replay store while keeping its own session map — and from the default
-  side, the pod's sessions read as retired. `_replay_store_cotenants()` enumerates
-  the pod root (host-side state at a known location) and the message names the
-  eviction command, because a refusal a user cannot act on is not better than the
-  hazard. A dev gateway pointed at some other `KIROCREW_HOME` is **not**
-  discoverable and remains a Known Limitation.
+  discoverable co-tenant shares its store. `_replay_store_cotenants()` enumerates the
+  pod root (host-side state at a known location) and names a pod only when it meets
+  **both** conditions: it has a **live** unit, **and** it does not own its own store.
+  The liveness test is what stops a home left behind by a pod that no longer exists
+  from blocking reclaim forever — the eviction the message recommends cannot clear a
+  directory whose pod is already gone. It comes from `pod.runtime.live_names()`
+  rather than `active_names()`, because the listing shape reports an empty set both
+  when nothing is running and when the query failed.
+- **Owning a store is RECORDED by the pod's own boot, never inferred by the reader.**
+  `boot()` writes the `KIRO_HOME` it hands the pod into the per-pod env file
+  (`record_replay_store`, taken from `build_pod_env`'s own output at the moment of
+  `exec`), and the guard reads it back. Nothing re-derives the path: a derivation
+  answers for a pod booted by *today's* code, while a running pod may have been
+  launched by an older one and would then be writing into the shared store. A
+  directory existing under the pod home is no better — a stale private store survives
+  a version rollback that reuses the pod's name. **No record therefore means
+  sharing**, so a pod is protected unless its own boot proved otherwise. `pod down`
+  deletes the env file, so a record never outlives its pod.
+- **Every uncertainty resolves toward refusing.** Exactly one thing short-circuits to
+  "no co-tenants": a platform that cannot run pods at all (`IS_LINUX or IS_MACOS`) — a
+  static property, not a probe. A *failed* service-manager probe on a platform that
+  can run pods leaves liveness unknown, so every pod counts. An empty pod root also
+  answers with no service-manager call. A dev gateway pointed at some other
+  `KIROCREW_HOME` is **not** discoverable and remains a Known Limitation.
 
-Because that check reads real host state, tests must isolate `KIROCREW_POD_ROOT`
-alongside the homes, or their result depends on whether the machine happens to have
-pods.
+Because that check reads real host state, tests must isolate `KIROCREW_POD_ROOT` and
+`KIROCREW_POD_ENV_DIR` (which holds the recorded store) alongside the homes, or their
+result depends on whether the machine happens to have pods.
 
 The freshness floor narrows the window but does not close it, since a session idle
 for a day is still resumable. Isolating both homes, or neither, is safe. The reason

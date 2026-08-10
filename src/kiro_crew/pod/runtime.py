@@ -28,7 +28,7 @@ from kiro_crew.platform_compat import IS_LINUX, IS_MACOS
 from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
-from kiro_crew.pod.config import PodConfig
+from kiro_crew.pod.config import PodConfig, pod_kiro_home
 
 # Pod names become systemd instance names and path segments; keep them strict.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,60}$")
@@ -63,6 +63,10 @@ APPROVAL_MODES: tuple[str, ...] = ("reads", "yolo", "interactive")
 # and these are the obvious alternatives. Anything else is treated as OFF, which
 # is the pre-existing ``--no-crons`` behavior and the safer of the two.
 CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+
+# Env-file key holding the ``KIRO_HOME`` a boot handed the pod. A RECORD of what
+# was exported, not a pinned input like ``CHECKOUT=`` — see record_replay_store.
+RESOLVED_KIRO_HOME = "RESOLVED_KIRO_HOME"
 
 
 def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
@@ -103,6 +107,34 @@ def write_env_file(cfg: PodConfig, name: str, updates: dict[str, str]) -> None:
     cfg.pods_dir.mkdir(parents=True, exist_ok=True)
     body = "".join(f"{k}='{v}'\n" for k, v in data.items())
     cfg.env_file(name).write_text(body)
+
+
+def record_replay_store(cfg: PodConfig, name: str, kiro_home: str) -> None:
+    """Record the ``KIRO_HOME`` this boot is handing the pod, as host-side state.
+
+    Written from :func:`build_pod_env`'s own output at the moment of ``exec``, so it
+    is what the pod IS running with rather than a value a reader re-derived. That
+    distinction is the point: a reader deriving the store answers for a pod booted
+    by TODAY's code, while a pod already running may have been launched by an older
+    one. Session-storage reclaim decides whether a pod shares its replay store from
+    this record and treats absence as sharing, so an unrecorded pod is protected
+    rather than assumed isolated.
+
+    Lives in the per-pod env file because that is already the host-side registry at
+    a known location, readable by a process with no view into the pod. ``pod down``
+    deletes that file, so a record never outlives the pod that wrote it.
+    """
+    write_env_file(cfg, name, {RESOLVED_KIRO_HOME: kiro_home})
+
+
+def recorded_replay_store(cfg: PodConfig, name: str) -> Path | None:
+    """The store pod *name* was booted with, or ``None`` when nothing recorded it.
+
+    ``None`` means "cannot be established", never "isolated" — see
+    :func:`record_replay_store` for why the caller must fail closed on it.
+    """
+    raw = read_env_file(cfg, name).get(RESOLVED_KIRO_HOME, "").strip()
+    return Path(raw).expanduser() if raw else None
 
 
 def pin_checkout(cfg: PodConfig, name: str, checkout: Path) -> None:
@@ -406,17 +438,53 @@ def recent_journal(cfg: PodConfig, name: str, lines: int = 30) -> str:
 
 
 def active_names(cfg: PodConfig) -> set[str]:
-    """Worktree names with an active pod unit (one cheap call)."""
+    """Worktree names with an active pod unit (one cheap call).
+
+    A listing: an empty set means "none active" AND "the query failed", which is
+    what a display surface wants. A caller that must not ACT while a pod is live
+    needs those told apart — see :func:`live_names`.
+    """
     if IS_MACOS:
         try:
             return launchd.active_names(cfg)
         except launchd.LaunchdError as exc:
             raise PodError(str(exc)) from exc
+    return _parse_active_units(cfg, _list_active_units(cfg).stdout)
+
+
+def live_names(cfg: PodConfig) -> set[str]:
+    """Active pod names, RAISING when the service manager could not answer.
+
+    The fail-closed twin of :func:`active_names`, for a caller whose decision is
+    unsafe under a wrong "nothing is running" — a transient ``systemctl`` failure
+    returns nonzero with empty stdout, indistinguishable from an idle host in the
+    listing shape. Reclaiming session storage while a co-tenant pod can still
+    resume a session destroys that conversation, so the guard needs the
+    distinction rather than the convenience.
+
+    The launchd path already refuses to call a pod absent when it cannot query, so
+    on macOS this is exactly :func:`active_names`.
+    """
+    if IS_MACOS:
+        return active_names(cfg)
+    cp = _list_active_units(cfg)
+    if cp.returncode != 0:
+        raise PodError(
+            f"could not list active pod units (systemctl exit {cp.returncode}): "
+            f"{cp.stderr.strip() or 'no error output'}"
+        )
+    return _parse_active_units(cfg, cp.stdout)
+
+
+def _list_active_units(cfg: PodConfig) -> subprocess.CompletedProcess:
     pat = f"{cfg.unit_prefix}@*.service"
-    cp = systemctl("list-units", pat, "--state=active", "--no-legend", "--plain", "--no-pager")
+    return systemctl("list-units", pat, "--state=active", "--no-legend", "--plain", "--no-pager")
+
+
+def _parse_active_units(cfg: PodConfig, stdout: str) -> set[str]:
     rx = re.compile(rf"{re.escape(cfg.unit_prefix)}@(.+)\.service")
     names: set[str] = set()
-    for ln in cp.stdout.splitlines():
+    for ln in stdout.splitlines():
         parts = ln.split()
         if not parts:
             continue
@@ -697,24 +765,9 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         # real lessons). Safe only because every KiroCrew reader of the transcripts
         # dir now resolves through ``kiro_sessions_dir()``; without that the pod
         # would write sessions somewhere KiroCrew never looks and lose resume.
-        # Inside the pod HOME so the zero-residue ``ExecStopPost`` teardown
-        # reclaims it.
-        "KIRO_HOME": str(home_dir / "kiro"),
-        # NOTE: deliberately NO ``KIRO_HOME`` here, though it is tempting — it
-        # would give the pod its own agent specs and stop pod boots rewriting the
-        # machine-wide ``~/.kiro/agents``. ``KIRO_HOME`` is a DIRECTORY-WIDE
-        # kiro-cli override (agents, prompts, skills, steering, settings AND
-        # sessions), while KiroCrew still resolves the host paths for roughly two
-        # dozen of those readers — ``session_map.py``, ``subagent_persistence.py``,
-        # ``acp/{client,session_handle,session_provider}.py``,
-        # ``providers/acp.py``, ``dashboard/handlers/usage.py`` and the
-        # ``settings/mcp.json`` sites. Exporting it here would move where kiro-cli
-        # WRITES session transcripts without moving where KiroCrew READS them, so a
-        # pod restart would lose session resume and ``SessionMap`` would prune
-        # mappings whose transcripts it can no longer see: a worse split brain than
-        # the one this change set fixes. The write guard in ``agent.py`` covers the
-        # shared-spec hazard for pods in the meantime. Setting it here is safe only
-        # once those readers resolve through ``kiro_home()`` too.
+        # Derived through ``pod_kiro_home`` so this export and the value ``boot``
+        # records for the session-storage reclaim guard cannot be two spellings.
+        "KIRO_HOME": str(pod_kiro_home(home_dir)),
         # Give the pod its OWN workspace root. Without this, `workspace_root()`
         # finds no `KIROCREW_WORKSPACE` and no `config_dir()/workspace_dir` file in
         # a fresh pod home, so it falls through to the platform default under the
@@ -1055,6 +1108,7 @@ def boot(cfg: PodConfig, name: str) -> int:
     print(f"kirocrew-pod: name={name} port={port} home={home_dir} checkout={checkout}")
 
     pod_env = build_pod_env(cfg, home_dir, port, checkout)
+    record_replay_store(cfg, name, pod_env["KIRO_HOME"])
     argv = ["gateway"]
     if not crons:
         argv.append("--no-crons")
