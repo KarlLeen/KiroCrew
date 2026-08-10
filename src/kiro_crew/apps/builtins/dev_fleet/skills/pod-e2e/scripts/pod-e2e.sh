@@ -7,7 +7,8 @@
 #   kirocrew pod up --json  →  health poll  →  auth check  →  API tests  →  Playwright  →  pod down
 #
 # Everything runs on the pod's own port + its own KIROCREW_HOME. The live
-# gateway is never bounced. Teardown is zero-residue unless
+# gateway is never bounced. Teardown deletes the pod's HOME and verifies it is
+# gone (a survivor is reported, not called zero residue) unless
 # --keep / --no-stop is passed.
 #
 # Exit code = number of failed phases (0 = all green). Structured summary + an
@@ -115,6 +116,20 @@ if [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT" ]; then
   echo "  Ensure a git worktree with basename '$NAME' exists, or set KIROCREW_POD_REPO / KIROCREW_POD_WORKTREES_ROOT" >&2
   exit 66
 fi
+
+# Prefer the WORKTREE'S OWN CLI for the pod verbs, now that the checkout is known.
+# The PATH-resolved binary above is whatever build happens to be installed on the
+# host, so on a machine whose install predates the branch under test, `pod up` /
+# `pod down` exercise the INSTALLED code and the verdict describes the wrong build.
+# That is not hypothetical: it is how a teardown fix was verified green while the
+# harness's own `down` — running the older CLI — left the pod HOME on disk.
+# Fall back to the PATH binary when the worktree has no venv yet (the provision
+# step below builds one, and `pod --help` proves the candidate is usable).
+_wt_kc="$CHECKOUT/.venv/bin/kirocrew"
+if [ -x "$_wt_kc" ] && "$_wt_kc" pod --help >/dev/null 2>&1; then
+  KIROCREW_CLI="$_wt_kc"
+fi
+echo "kirocrew CLI: $KIROCREW_CLI"
 
 # Playwright runner (sibling script)
 PW_PY="${KIROCREW_PW_PY:-}"
