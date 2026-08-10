@@ -7,8 +7,18 @@
     "isort --check-only src/kiro_crew test",
     "flake8 src/kiro_crew test",
     "mypy src/kiro_crew/",
+    "python3 scripts/check_brand_name.py --test",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && BRAND_BASE_REF=\"$BASE\" python3 scripts/check_brand_name.py",
+    "python3 scripts/docs_lint.py --test",
+    "./scripts/docs-lint.sh",
+    "python3 scripts/verify_vendor_manifest.py",
+    "./scripts/scrub-lint.sh --no-history",
     "npm --prefix website run build",
-    "npm --prefix website test"
+    "MW=\"$(grep -oE 'npx eslint src/ --max-warnings [0-9]+' .github/workflows/ci.yml | grep -oE '[0-9]+$')\" && [ -n \"$MW\" ] && (cd website && npx eslint src/ --max-warnings \"$MW\")",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && I18N_BASE_REF=\"$BASE\" npm --prefix website run i18n:check",
+    "(cd website && npx playwright install chromium)",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && I18N_BASE_REF=\"$BASE\" npm --prefix website run i18n:render",
+    "BASE=\"$(git merge-base HEAD origin/main)\" && I18N_BASE_REF=\"$BASE\" npm --prefix website test"
   ],
   "rule_files": [
     "AUTOSDE.yaml",
