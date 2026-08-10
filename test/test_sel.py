@@ -1455,3 +1455,56 @@ class TestHmacKeyTrustDirMigration:
         (tmp_path / "sel_hmac.key").write_bytes(b"x" * 8)
         with pytest.raises(RuntimeError, match="too short"):
             SecurityEventLog(base_dir=tmp_path, sync=True)
+
+    def test_key_bytes_accessor_returns_the_live_signing_key(
+        self, tmp_path: Path
+    ) -> None:
+        """The recovery path for the dependent protocol: SEL caches the
+        validated bytes at init, so they stay available when the file behind the
+        frozen resolved path no longer loads."""
+        from kiro_crew.sel import _sel_hmac_key_bytes
+
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert _sel_hmac_key_bytes() == log._hmac_key
+        # Still available after the file is gone — that is the whole point.
+        (tmp_path / "trust" / "sel_hmac.key").unlink()
+        assert _sel_hmac_key_bytes() == log._hmac_key
+
+    def test_key_bytes_accessor_is_none_without_a_live_singleton(self) -> None:
+        """The verifying MCP process has no singleton; it must get None rather
+        than a partially-constructed instance's attribute."""
+        from kiro_crew.sel import _sel_hmac_key_bytes
+
+        self._reset()
+        assert _sel_hmac_key_bytes() is None
+
+    def test_key_bytes_accessor_is_none_mid_construction(self) -> None:
+        """``__new__`` publishes the instance to ``_instance`` BEFORE ``__init__``
+        loads the key, so a concurrent reader can see an instance whose
+        ``_hmac_key`` does not exist yet. ``_initialized`` is the barrier that
+        makes that window return None instead of raising or yielding garbage."""
+        from kiro_crew.sel import SecurityEventLog as _SEL
+        from kiro_crew.sel import _sel_hmac_key_bytes
+
+        self._reset()
+        try:
+            _SEL.__new__(_SEL)  # publishes _instance, leaves _initialized False
+            assert _SEL._instance is not None
+            assert not getattr(_SEL._instance, "_initialized", False)
+            assert _sel_hmac_key_bytes() is None
+        finally:
+            self._reset()
+
+    def test_key_bytes_accessor_has_exactly_one_production_caller(self) -> None:
+        """Handing out raw trust-root bytes is safe only under the file-first
+        ordering its ONE caller enforces; a second caller would inherit none of
+        it. Pin the caller set rather than trusting the underscore."""
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        callers = {
+            path
+            for path in root.rglob("*.py")
+            if path.name != "sel.py" and "_sel_hmac_key_bytes" in path.read_text()
+        }
+        assert callers == {root / "session_pid_sig.py"}, (
+            f"_sel_hmac_key_bytes gained a caller outside session_pid_sig: {callers}"
+        )

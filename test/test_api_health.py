@@ -436,6 +436,29 @@ def test_both_servers_install_the_shared_host_barrier() -> None:
         )
 
 
+def test_both_servers_audit_the_csrf_denial() -> None:
+    """Wiring pin: BOTH entrypoints must write a SEL denial for a CSRF refusal.
+
+    ``sel_audit_middleware`` is registered INNER to the CSRF barrier, so a bare
+    ``raise web.HTTPForbidden`` there produces a 403 that appears nowhere in the
+    audit log — breaking the deny-or-audit invariant the auth layer states for
+    itself, and leaving an operator with a refusal and no record of it.
+    """
+    import inspect
+
+    from kiro_crew.dashboard import server as server_mod
+
+    for func, name in (
+        (server_mod.start_dashboard, "start_dashboard"),
+        (server_mod.start_api_server, "start_api_server"),
+    ):
+        src = inspect.getsource(func)
+        csrf_arm = src.split("CSRF check failed: request origin not allowed.")[0]
+        assert "CSRF check failed: origin not allowed" in csrf_arm, (
+            f"{name} raises the CSRF 403 without logging a SEL denial first"
+        )
+
+
 def test_both_servers_warm_the_kiro_readiness_probe() -> None:
     """Wiring pin: BOTH entrypoints must warm the Kiro readiness probe at boot.
 

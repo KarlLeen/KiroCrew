@@ -3174,6 +3174,28 @@ async def start_dashboard(
     ) -> web.StreamResponse:
         if request.method not in _safe_methods:
             if not check_origin(request, require=True, fallback_header="Referer"):
+                # Audit the CSRF denial (security-relevant permission decision),
+                # mirroring host_validation_middleware. sel_audit_middleware is
+                # registered INNER to this one, so a bare raise here produces a
+                # 403 that appears nowhere in the audit log.
+                #
+                # Best-effort, like _log_auth: a trust root too short to sign
+                # the chain makes the SEL singleton refuse to construct, and an
+                # unguarded write would turn this refusal into a 500 — losing
+                # the denial itself to report the denial.
+                try:
+                    sel().log_api_access(
+                        caller="dashboard_user",
+                        operation=f"{request.method} {request.path}",
+                        outcome="denied",
+                        resources=request.path,
+                        error=(
+                            "CSRF check failed: origin not allowed: "
+                            f"{request.headers.get('Origin', '')[:100]}"
+                        ),
+                    )
+                except Exception:
+                    logger.warning("Failed to log CSRF denial to SEL", exc_info=True)
                 raise web.HTTPForbidden(
                     text="CSRF check failed: request origin not allowed.",
                     content_type="text/plain",
@@ -3786,14 +3808,19 @@ async def start_api_server(
         if request.method not in _safe_methods:
             if not check_origin(request, require=True, fallback_header="Referer"):
                 # Audit the CSRF denial (security-relevant permission decision),
-                # mirroring host_validation_middleware.
-                sel().log_api_access(
-                    caller="mcp_tool",
-                    operation=f"{request.method} {request.path}",
-                    outcome="denied",
-                    resources=request.path,
-                    error=f"CSRF check failed: origin not allowed: {request.headers.get('Origin', '')[:100]}",
-                )
+                # mirroring host_validation_middleware. Best-effort, like
+                # _log_auth: an unguarded write would turn this refusal into a
+                # 500 when the SEL singleton refuses to construct.
+                try:
+                    sel().log_api_access(
+                        caller="mcp_tool",
+                        operation=f"{request.method} {request.path}",
+                        outcome="denied",
+                        resources=request.path,
+                        error=f"CSRF check failed: origin not allowed: {request.headers.get('Origin', '')[:100]}",
+                    )
+                except Exception:
+                    logger.warning("Failed to log CSRF denial to SEL", exc_info=True)
                 raise web.HTTPForbidden(
                     text="CSRF check failed: request origin not allowed.",
                     content_type="text/plain",

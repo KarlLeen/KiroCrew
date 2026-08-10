@@ -1129,3 +1129,35 @@ def sel_hmac_key_path() -> Path:
     if inst is not None and getattr(inst, "_initialized", False):
         return inst._hmac_key_file
     return _default_dir() / _TRUST_SUBDIR / _HMAC_KEY_FILE
+
+
+def _sel_hmac_key_bytes() -> bytes | None:
+    """Return the live singleton's trust-root key BYTES, or ``None``.
+
+    Module-private with exactly ONE intended caller
+    (``session_pid_sig._load_hmac_key``), because the safety of handing out raw
+    trust-root material rests on an ordering rule the CALLER enforces, not the
+    accessor: the FILE must be preferred and this used only as a fallback. A
+    readable file is the anchor every OTHER process resolves independently, so a
+    second caller that reached for memory first would sign MACs a separate
+    verifier rejects. Keeping one caller keeps that rule enforceable.
+
+    ``SecurityEventLog`` reads the key once at init and signs every subsequent
+    record from that in-memory copy, so the audit chain is immune to the key
+    file moving, being deleted, losing read permission, or being truncated
+    afterwards. The dependent protocol that re-reads the file on every use is
+    not, and its resolved path is never re-resolved — which is how a gateway
+    ends up publishing unsigned identities forever while its audit chain still
+    looks healthy. These are the same bytes, already validated at init
+    (``>= _HMAC_KEY_MIN_BYTES``, see ``_load_or_create_hmac_key``).
+
+    Returns ``None`` when no initialized singleton exists in this process (the
+    verifying MCP process, typically) or the cached key is unusable.
+    """
+    inst = SecurityEventLog._instance
+    if inst is None or not getattr(inst, "_initialized", False):
+        return None
+    key = getattr(inst, "_hmac_key", None)
+    if isinstance(key, bytes) and len(key) >= _HMAC_KEY_MIN_BYTES:
+        return key
+    return None
